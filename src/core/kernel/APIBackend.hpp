@@ -34,7 +34,7 @@ namespace Qv2ray::core::kernel
 
       private:
         QvAPITagProtocolConfig tagProtocolConfig;
-        QThread *workThread;
+        std::unique_ptr<std::thread> workThread;
         //
         bool started = false;
         bool running = false;

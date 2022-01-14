@@ -1,6 +1,7 @@
 #include "APIBackend.hpp"
 
 #include "uvw.hpp"
+#include <thread>
 
 #define QV_MODULE_NAME "gRPCBackend"
 
@@ -181,19 +182,60 @@ namespace Qv2ray::core::kernel{
         int resCount = 0;
     };
 
+    void parseAndReplyGRPC(ParseV2rayAPI& apiParser,uvw::DataEvent& data,uvw::TCPHandle& tcp){
+        auto st = size_t(0);
+        while (st < data.length) {
+            size_t frame_len =
+                ((uchar) (data.data[st]) << 16) + (((uchar) data.data[st + 1]) << 8) + ((uchar) data.data[st + 2]) +
+                9;
+            unsigned frame_type = (unsigned char) (data.data[st + 3]);
+            //cout << "frame len:" << frame_len << " frame type:" << frame_type << endl;
+            std::unique_ptr<char[]> buf;
+            switch (frame_type) {
+                case 0x06:
+                    //ping, need response
+                    if (data.data[4] == 0x01) break;
+                    buf = std::make_unique<char[]>(frame_len);
+                    memcpy(buf.get(), data.data.get() + st, frame_len);
+                    buf[4] = 0x01;
+                    tcp.write(std::move(buf), frame_len);
+                    break;
+                case 0x04:
+                    //settings, need response
+                    tcp.write(reinterpret_cast<char *>(settings_ack), 9);
+                    break;
+                case 0x00:
+                    //data
+                    apiParser.parse_v2ray_api_response(data.data, st);
+                    break;
+                default:
+                    // ignore it
+                    break;
+            }
+            st += frame_len;
+        }
+        if(st!=data.length){
+            assert(0);
+        }
+        tcp.once<uvw::DataEvent>([&apiParser](auto& d,auto& h){
+          parseAndReplyGRPC(apiParser,d,h);
+        });
+    }
+
     void conn(const std::shared_ptr<uvw::TCPHandle> &tcp,int& apiFailCounter,bool& dialed,
               bool& readyReq,
               ParseV2rayAPI& apiParser
     ) {
 
-        tcp->on<uvw::ErrorEvent>([&apiFailCounter,&dialed,&readyReq](const uvw::ErrorEvent & e, uvw::TCPHandle &tcp) { /* handle errors */
-          LOG("API call failure with error:"+ QString(e.what()));
+        tcp->once<uvw::ErrorEvent>([&apiFailCounter,&dialed,&readyReq](const uvw::ErrorEvent & e, uvw::TCPHandle &tcp) { /* handle errors */
+          LOG("API call failure with error:"+ QString(e.what())+" API fail counter:"+ QSTRN(apiFailCounter));
           if(dialed){
-               apiFailCounter++;
-               tcp.close();
-               dialed= false;
-               readyReq = false;
-           }
+              apiFailCounter++;
+              tcp.stop();
+              tcp.close();
+              dialed= false;
+              readyReq = false;
+          }
         });
 
         tcp->once<uvw::ConnectEvent>([&dialed,&readyReq](const uvw::ConnectEvent &, uvw::TCPHandle &tcp) {
@@ -202,40 +244,9 @@ namespace Qv2ray::core::kernel{
           dialed= true;
           readyReq=true;
         });
-        tcp->on<uvw::DataEvent>([&apiParser](uvw::DataEvent &data, uvw::TCPHandle &tcp) {
-                                  using namespace std;
-                                  auto st = size_t(0);
-                                  while (st < data.length) {
-                                      size_t frame_len =
-                                          ((uchar) (data.data[st]) << 16) + (((uchar) data.data[st + 1]) << 8) + ((uchar) data.data[st + 2]) +
-                                          9;
-                                      unsigned frame_type = (unsigned char) (data.data[st + 3]);
-                                      //cout << "frame len:" << frame_len << " frame type:" << frame_type << endl;
-                                      std::unique_ptr<char[]> buf;
-                                      switch (frame_type) {
-                                          case 0x06:
-                                              //ping, need response
-                                              if (data.data[4] == 0x01) break;
-                                              buf = make_unique<char[]>(frame_len);
-                                              memcpy(buf.get(), data.data.get() + st, frame_len);
-                                              buf[4] = 0x01;
-                                              tcp.write(std::move(buf), frame_len);
-                                              break;
-                                          case 0x04:
-                                              //settings, need response
-                                              tcp.write(reinterpret_cast<char *>(settings_ack), 9);
-                                              break;
-                                          case 0x00:
-                                              //data
-                                              apiParser.parse_v2ray_api_response(data.data, st);
-                                              break;
-                                          default:
-                                              // ignore it
-                                              break;
-                                      }
-                                      st += frame_len;
+        tcp->once<uvw::DataEvent>([&apiParser](auto &d,auto &h) {
+                                    parseAndReplyGRPC(apiParser,d,h);
                                   }
-                                }
         );
         tcp->connect(std::string{"127.0.0.1"}, GlobalConfig.kernelConfig.statsPort);
     }
@@ -243,26 +254,24 @@ namespace Qv2ray::core::kernel{
 
 namespace Qv2ray::core::kernel
 {
-    constexpr auto Qv2ray_GRPC_ERROR_RETCODE = -1;
     static QvAPIDataTypeConfig DefaultInboundAPIConfig{ { API_INBOUND, { "dokodemo-door", "http", "socks" } } };
     static QvAPIDataTypeConfig DefaultOutboundAPIConfig{ { API_OUTBOUND_PROXY,
-                                                           { "dns", "http", "mtproto", "shadowsocks", "socks", "vmess", "vless" } },
+                                                                                   { "dns", "http", "mtproto", "shadowsocks", "socks", "vmess", "vless" } },
                                                          { API_OUTBOUND_DIRECT, { "freedom" } },
                                                          { API_OUTBOUND_BLACKHOLE, { "blackhole" } } };
 
     APIWorker::APIWorker()
     {
-        workThread = new QThread();
-        this->moveToThread(workThread);
+        workThread = std::make_unique<std::thread>([this](){process();});
         DEBUG("API Worker initialised.");
-        connect(workThread, &QThread::started, this, &APIWorker::process);
-        connect(workThread, &QThread::finished, [] { LOG("API thread stopped"); });
-        started = true;
-        workThread->start();
     }
 
     void APIWorker::StartAPI(const QMap<bool, QMap<QString, QString>> &tagProtocolPair)
     {
+        if(!running){
+            workThread->join();
+            workThread = std::make_unique<std::thread>([this](){process();});
+        }
         // Config API
         tagProtocolConfig.clear();
         for (const auto &key : tagProtocolPair.keys())
@@ -289,84 +298,97 @@ namespace Qv2ray::core::kernel
     // --- DESTRUCTOR ---
     APIWorker::~APIWorker()
     {
+        LOG("worker thread stoping!");
         StopAPI();
         // Set started signal to false and wait for API thread to stop.
-        started = false;
-        workThread->wait();
-        delete workThread;
+        workThread->join();
+        LOG("worker thread done!");
     }
 
     // API Core Operations
     // Start processing data.
     void APIWorker::process()
     {
-        DEBUG("API Worker started.");
+        LOG("API Worker started.");
 #ifndef _WIN32
         signal(SIGPIPE, SIG_IGN);
 #endif
-        bool dialed = false;
-        bool readyReq = false;
-        int apiFailCounter = 0;
-        auto loop = uvw::Loop::getDefault();
-        auto tcp = loop->resource<uvw::TCPHandle>();
-        auto stopTimer = loop->resource<uvw::TimerHandle>();
-        auto apiParser = ParseV2rayAPI{};
-        stopTimer->on<uvw::TimerEvent>([this,&loop,&tcp,&apiFailCounter,&dialed,&apiParser,&readyReq](auto &, auto &handle) {
-            if (!running)
-            {
-                int timer_count = 0;
-                uv_walk(
-                    loop->raw(),
-                    [](uv_handle_t *handle, void *arg)
-                    {
-                        int &counter = *static_cast<int *>(arg);
-                        if (uv_is_closing(handle) == 0)
-                            counter++;
-                    },
-                    &timer_count);
-                if (timer_count == 1) // only current timer
+        {
+            bool dialed = false;
+            bool readyReq = false;
+            int apiFailCounter = 0;
+            auto loop = uvw::Loop::getDefault();
+            auto tcp = loop->resource<uvw::TCPHandle>();
+            auto stopTimer = loop->resource<uvw::TimerHandle>();
+            auto apiParser = ParseV2rayAPI{};
+            stopTimer->on<uvw::TimerEvent>(
+                [this, &loop, &tcp, &apiFailCounter, &dialed, &apiParser, &readyReq](auto &, auto &handle)
                 {
-                    handle.stop();
-                    handle.close();
-                    loop->clear();
-                    loop->close();
-                    loop->stop();
-                }
-            }else{
-                if (!dialed){
-                    tcp = loop->resource<uvw::TCPHandle>();
-                    conn(tcp,apiFailCounter,dialed,readyReq,apiParser);
-                    dialed=true;
-                }
-                if(!readyReq){
-                    return;
-                }
-                if (apiFailCounter == QV2RAY_API_CALL_FAILEDCHECK_THRESHOLD)
-                {
-                    LOG("API call failure threshold reached, cancelling further API aclls.");
-                    emit OnAPIErrored(tr("Failed to get statistics data, please check if V2Ray is running properly"));
-                    apiFailCounter++;
-                    return;
-                }
-                else if (apiFailCounter > QV2RAY_API_CALL_FAILEDCHECK_THRESHOLD)
-                {
-                    return;
-                }
-                switch (apiParser.poll())
-                {
-                    case ParseV2rayAPI::ParserState::READY:
-                        emit onAPIDataReady(apiParser.emitData());
-                        break;
-                    case ParseV2rayAPI::ParserState::NO_REQ:
-                        apiParser.addRequest(tcp,tagProtocolConfig);
-                        break;
-                    case ParseV2rayAPI::ParserState::NOT_READY:
-                        break;
-                }
-            }
-          });
-        stopTimer->start(uvw::TimerHandle::Time{ 1000 }, uvw::TimerHandle::Time{ 1000 });
-        loop->run();
+                  if (!running)
+                  {
+                      int timer_count = 0;
+                      uv_walk(
+                          loop->raw(),
+                          [](uv_handle_t *handle, void *arg)
+                          {
+                            int &counter = *static_cast<int *>(arg);
+                            if (uv_is_closing(handle) == 0)
+                                counter++;
+                          },
+                          &timer_count);
+                      LOG("timer_count:" + QSTRN(timer_count));
+                      if (timer_count == 1) // only current timer
+                      {
+                          handle.stop();
+                          handle.close();
+                          loop->clear();
+                          loop->close();
+                          loop->stop();
+                      }
+                      else if(tcp)
+                      {
+                          tcp->stop();
+                          tcp->close();
+                      }
+                  }
+                  else
+                  {
+                      if (!dialed)
+                      {
+                          if(tcp) {
+                              tcp->stop();
+                              tcp->close();
+                          }
+                          tcp = loop->resource<uvw::TCPHandle>();
+                          conn(tcp, apiFailCounter, dialed, readyReq, apiParser);
+                          dialed = true;
+                      }
+                      if (!readyReq)
+                      {
+                          return;
+                      }
+                      if (apiFailCounter == QV2RAY_API_CALL_FAILEDCHECK_THRESHOLD)
+                      {
+                          LOG("API call failure threshold reached, cancelling further API aclls.");
+                          emit OnAPIErrored(tr("Failed to get statistics data, please check if V2Ray is running properly"));
+                          apiFailCounter++;
+                          return;
+                      }
+                      else if (apiFailCounter > QV2RAY_API_CALL_FAILEDCHECK_THRESHOLD)
+                      {
+                          return;
+                      }
+                      switch (apiParser.poll())
+                      {
+                          case ParseV2rayAPI::ParserState::READY: emit onAPIDataReady(apiParser.emitData()); break;
+                          case ParseV2rayAPI::ParserState::NO_REQ: apiParser.addRequest(tcp, tagProtocolConfig); break;
+                          case ParseV2rayAPI::ParserState::NOT_READY: break;
+                      }
+                  }
+                });
+            stopTimer->start(uvw::TimerHandle::Time{ 1000 }, uvw::TimerHandle::Time{ 1000 });
+            loop->run();
+        }
     }
 
 } // namespace Qv2ray::core::kernel
