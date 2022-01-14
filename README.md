@@ -10,6 +10,10 @@
 [![GitHub Releases](https://img.shields.io/github/downloads/Qv2ray/Qv2ray/latest/total?style=flat-square&logo=github)](https://github.com/Qv2ray/Qv2ray/releases)
 [![GitHub All Releases](https://img.shields.io/github/downloads/Qv2ray/Qv2ray/total?label=downloads-total&logo=github&style=flat-square)](https://github.com/Qv2ray/Qv2ray/releases)
 
+## 该fork与官方Qv2ray的不同
+
+* dev 分支移除了 protobuf 和 grpc 的依赖.
+
 ## 本项目已不再维护
 
 > Qv2ray: *2019-03-28 - 2021-08-17*
